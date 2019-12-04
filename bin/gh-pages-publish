@@ -1,0 +1,154 @@
+#!/bin/bash
+
+ME=`basename $0`
+
+red=`echo -e '\033[1;31m'`
+yellow=`echo -e '\033[1;33m'`
+blue=`echo -e '\033[1;34m'`
+NC=`echo -e '\033[0m'` # No color
+
+function usage() {
+  echo "Usage: $ME [--build=<build command>] <path> [<remote>]";
+  echo;
+  echo "Pushes the contents of <path> to the gh-pages branch on <remote>,";
+  echo "running an optional build command first. Uses the remote tracked by";
+  echo "the current branch if <remote> is not specified.";
+  echo;
+  echo "  <path>      directory to push as the contents of <remote>/gh-pages";
+  echo "  [<remote>]  remote repository to push to";
+  echo;
+  echo "  -h, --help    Show help";
+  echo "  --build ...   Runs build command before pushing to gh-pages";
+}
+
+BUILD_CMD='';
+OTHER_ARGS=();
+DIR='';
+BRANCH='';
+REMOTE='';
+
+while [[ $# -gt 0 ]]
+do
+  OPT="$1"
+  case $OPT in
+    -h|--help)
+      usage;
+      exit 0;
+      ;;
+    --build)
+      BUILD_CMD="$2"
+      shift 2
+      ;;
+    --build=*)
+      BUILD_CMD="${OPT#*=}"
+      shift 1
+      ;;
+    *)
+      OTHER_ARGS+=("$1")
+      shift 1;
+      ;;
+  esac
+done
+
+if [ ${#OTHER_ARGS[@]} -lt 1 ]; then
+  echo "${red}ERROR: No path specified.${NC}" 1>&2;
+  echo "Please specify a directory to publish." 1>&2;
+  echo;
+  usage;
+  exit 1;
+fi
+
+# Directory to push to gh-pages branch (with any leading './' removed)
+DIR=${OTHER_ARGS[0]#'./'}
+
+# Get the current branch
+BRANCH=`git rev-parse --abbrev-ref HEAD`
+
+if [ ${#OTHER_ARGS[@]} -gt 1 ]; then
+  # User-specified remote
+  REMOTE=${OTHER_ARGS[1]};
+else
+  # Default to the remote tracked by the current branch
+  REMOTE=`git config branch.$BRANCH.remote`;
+fi
+
+if [ -z "$REMOTE" ]; then
+  echo "${red}ERROR: No remote found for branch $BRANCH.${NC}" 1>&2;
+  echo "Please specify a remote name or set a remote on your branch." 1>&2;
+  echo;
+  usage;
+  exit 1;
+fi
+
+DETACHED_COMMIT='';
+# Switch back from the detached branch and restore the contents of the directory
+function switch_back_from_detached_branch() {
+  # Switch back to the original branch before exiting
+  git checkout --quiet -;
+  # Restore the contents of the directory in the working dir if it was put in a detached commit
+  if [ -n "$DETACHED_COMMIT" ]; then
+    # Checkout the contents of the detached commit back into the index
+    git checkout --quiet $DETACHED_COMMIT -- $DIR
+    # Unstage the directory
+    git reset --quiet HEAD -- $DIR
+  fi
+}
+
+# Create a detached branch
+git checkout --quiet --detach HEAD
+if [ $? -ne 0 ]; then
+  echo "${red}ERROR: Unable to create detached branch. Exiting.${NC}" 1>&2;
+  exit 1;
+fi
+
+# Run the optional build command
+if [ -n "$BUILD_CMD" ]; then
+  echo "${yellow}Running \"$BUILD_CMD\":${NC}";
+  ($BUILD_CMD)
+  if [ $? -ne 0 ]; then
+    echo "${red}ERROR: Build command failed. Exiting.${NC}" 1>&2;
+    switch_back_from_detached_branch;
+    exit 1;
+  fi
+  echo;
+fi
+
+# Add the directory to push to the index
+git add --force -- $DIR
+if [ $? -ne 0 ]; then
+  echo "${red}ERROR: Unable to git add $DIR. Exiting.${NC}" 1>&2;
+  switch_back_from_detached_branch;
+  exit 1;
+fi
+
+# Make a commit on the detached branch
+git commit --quiet --message="Detached commit made by $ME for pushing to gh-pages"
+if [ $? -ne 0 ]; then
+  echo "${red}ERROR: Unable to make detached commit. Exiting.${NC}" 1>&2;
+  switch_back_from_detached_branch;
+  exit 1;
+fi
+
+# Keep the hash of the detached commit
+DETACHED_COMMIT=`git rev-list -n 1 HEAD`
+
+# Split the directory into a subtree
+SUBTREE_COMMIT=`git subtree split -q --prefix "$DIR" HEAD`
+if [ $? -ne 0 ]; then
+  echo "${red}ERROR: Unable to subtree split directory $DIR. Exiting.${NC}" 1>&2;
+  switch_back_from_detached_branch;
+  exit 1;
+fi
+
+# Force push the subtree commit on top of <remote>/gh-pages
+# ":refs/heads/gh-pages" causes gh-pages branch to be created on <remote> if it doesn't exist
+git push --force $REMOTE $SUBTREE_COMMIT:refs/heads/gh-pages
+if [ $? -ne 0 ]; then
+  echo "${red}ERROR: Unable to push to $REMOTE/gh-pages. Exiting.${NC}" 1>&2;
+  switch_back_from_detached_branch;
+  exit 1;
+fi
+
+switch_back_from_detached_branch;
+
+echo "Directory ${yellow}$DIR${NC} was successfully pushed to ${blue}$REMOTE/gh-pages${NC}";
